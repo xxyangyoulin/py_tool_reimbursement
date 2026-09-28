@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """发票 + 付款截图 自动拼版工具
 
-用法: python3 merge_fp.py [材料目录]     (默认 ~/Downloads/fp)
+用法: python3 merge_fp.py [材料目录] [--no-cache]   (目录默认 ~/Downloads/fp)
+  --no-cache  忽略已有裁剪缓存，全部重新识别（新结果写回缓存）
 
 流程:
 1. 扫描目录中的发票 PDF 与付款截图，按文件名前缀自动分组（去尾部数字），
@@ -11,10 +12,14 @@
    完成后用 Chrome 打开
 
 环境变量（可写入脚本同目录 .env，兼容任何 OpenAI 兼容接口）:
-  AI_API_KEY    API Key（智谱: https://open.bigmodel.cn ；留空则用默认裁剪）
-  AI_BASE_URL   默认 https://open.bigmodel.cn/api/paas/v4
-  AI_MODEL      默认 glm-5.3-flash
+  AI_API_KEY       API Key（智谱: https://open.bigmodel.cn ；留空则用默认裁剪）
+  AI_BASE_URL      默认 https://open.bigmodel.cn/api/paas/v4
+  AI_MODEL         默认 glm-5.3-flash
+  AI_CONCURRENCY   截图识别并发数，默认 3（接口限流时可调小）
+裁剪坐标按「文件路径+修改时间+大小」缓存在脚本同目录 .crop_cache.json，
+文件未变时重跑不再调用接口。
 """
+import argparse
 import base64
 import io
 import json
@@ -23,8 +28,11 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 warnings.filterwarnings(
@@ -36,6 +44,7 @@ from pypdf import PdfReader, PdfWriter, Transformation
 # ---------- 配置 ----------
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME = Path.home()
+CACHE_FILE = SCRIPT_DIR / ".crop_cache.json"
 
 A4_W, A4_H = 595.276, 841.890   # pt
 HALF_H = A4_H / 2
@@ -76,6 +85,30 @@ def ai_settings():
         os.environ.get("AI_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").rstrip("/"),
         os.environ.get("AI_MODEL", "glm-5.3-flash"),
     )
+
+
+def ai_concurrency() -> int:
+    return max(1, int(os.environ.get("AI_CONCURRENCY", "3")))
+
+
+# ---------- 裁剪缓存 ----------
+def cache_key(path: Path) -> str:
+    st = path.stat()
+    return f"{path.name}:{int(st.st_mtime)}:{st.st_size}"
+
+
+def load_cache() -> dict:
+    if CACHE_FILE.exists():
+        try:
+            return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_cache(cache: dict):
+    CACHE_FILE.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 # ---------- 扫描分组 ----------
@@ -122,6 +155,7 @@ def _parse_crop_text(text: str):
 
 
 def ask_ai_crop(img: Image.Image, name: str):
+    """返回 ((top, bottom) 百分比, None) 或 (None, 错误信息)。"""
     key, base, model = ai_settings()
     if not key:
         return None, "未配置 AI_API_KEY"
@@ -150,7 +184,7 @@ def ask_ai_crop(img: Image.Image, name: str):
                  "Authorization": f"Bearer {key}"},
     )
     last_err = None
-    for attempt in (1, 2):  # 思考型模型偶发空回复，重试一次
+    for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read())
@@ -158,24 +192,46 @@ def ask_ai_crop(img: Image.Image, name: str):
             text = (msg.get("content") or "") + "\n" + (msg.get("reasoning_content") or "")
             box = _parse_crop_text(text)
             if box is None:
-                raise ValueError(f"回复中无有效 JSON: {text[:120]!r}")
+                last_err = f"回复中无有效 JSON: {text[:120]!r}"
+            elif not (0 <= box[0] < box[1] <= 100):
+                return None, f"模型返回越界 top={box[0]} bottom={box[1]}"
+            else:
+                return box, None
+        except urllib.error.HTTPError as e:
+            snippet = e.read()[:150].decode(errors="replace") if e.fp else e.reason
+            last_err = f"HTTP {e.code}: {snippet}"
+            if e.code == 429 and attempt < 2:  # 接口限流：退避后重试
+                wait = float(e.headers.get("Retry-After") or 2 * (attempt + 1))
+                print(f"  [限流] {name}: 429，等待 {wait:.0f}s 后重试")
+                time.sleep(wait)
+                continue
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
-            continue
-        if not (0 <= box[0] < box[1] <= 100):
-            return None, f"模型返回越界 top={box[0]} bottom={box[1]}"
-        return box, None
+        if attempt < 2:
+            time.sleep(1)
     return None, last_err
 
 
-def cropped_image(path: Path):
+def crop_box_for(path: Path, cache: dict, use_cache: bool = True):
+    """带缓存的裁剪坐标获取，供线程池并发调用。返回 (box, 来源标签)。"""
+    key = cache_key(path)
+    if use_cache and key in cache:
+        return tuple(cache[key]), "缓存"
     img = Image.open(path).convert("RGB")
     box, err = ask_ai_crop(img, path.name)
     if box is None:
-        box = DEFAULT_CROP
-        print(f"  [兜底] {path.name}: {err}，使用默认裁剪 {DEFAULT_CROP}")
-    else:
-        print(f"  [AI] {path.name}: 裁剪 {box[0]:.0f}% ~ {box[1]:.0f}%")
+        w, h = img.size
+        if 1.7 <= h / w <= 2.5:  # 手机屏幕竖长截图：关键信息基本在上半部
+            box = (0, 50)
+        else:
+            box = DEFAULT_CROP
+        return box, f"兜底({err})"
+    cache[key] = list(box)
+    return box, "AI"
+
+
+def cropped_image(path: Path, box) -> Image.Image:
+    img = Image.open(path).convert("RGB")
     w, h = img.size
     return img.crop((0, round(h * box[0] / 100), w, round(h * box[1] / 100)))
 
@@ -198,16 +254,16 @@ def paste_in_slot(page: Image.Image, img: Image.Image, slot: int):
     page.paste(img, (x, y))
 
 
-def compose_page(chunk):
+def compose_page(chunk, boxes: dict) -> Image.Image:
     page = Image.new("RGB", (round(A4_W * PX), round(A4_H * PX)), "white")
     for slot, name in enumerate(chunk):
         if name.lower().endswith(".pdf"):
             continue  # 发票位置留白，稍后矢量合并
-        paste_in_slot(page, cropped_image(SRC_DIR / name), slot)
+        paste_in_slot(page, cropped_image(SRC_DIR / name, boxes[name]), slot)
     return page
 
 
-def build(src: Path, out: Path):
+def build(src: Path, out: Path, use_cache: bool = True):
     groups = discover(src, exclude={out.name})
     if not groups:
         sys.exit(f"目录 {src} 中没有找到 PDF 或图片")
@@ -215,11 +271,29 @@ def build(src: Path, out: Path):
     SRC_DIR = src
 
     pages, invoice_slots = [], []
-    print(f"分组结果: " + ", ".join(f"{k}({len(v)}项)" for k, v in groups))
+    print("分组结果: " + ", ".join(f"{k}({len(v)}项)" for k, v in groups))
+
+    # 1) 并发获取所有截图的裁剪坐标（缓存命中则不调接口）
+    images = sorted({n for _, items in groups for n in items
+                     if not n.lower().endswith(".pdf")})
+    boxes = {}
+    if images:
+        cache = load_cache()  # --no-cache 时不读旧值；新结果仍写回，失败不丢旧值
+        workers = min(ai_concurrency(), len(images))
+        print(f"识别 {len(images)} 张截图裁剪区域（并发 {workers}）...")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {n: ex.submit(crop_box_for, src / n, cache, use_cache)
+                    for n in images}
+            for n in images:  # 按提交顺序打印，输出稳定
+                boxes[n], how = futs[n].result()
+                print(f"  [{how}] {n}: 裁剪 {boxes[n][0]:.0f}% ~ {boxes[n][1]:.0f}%")
+        save_cache(cache)
+
+    # 2) 拼版合成
     for _, items in groups:
         for i in range(0, len(items), 2):
             chunk = items[i:i + 2]
-            pages.append(compose_page(chunk))
+            pages.append(compose_page(chunk, boxes))
             for slot, name in enumerate(chunk):
                 if name.lower().endswith(".pdf"):
                     invoice_slots.append((len(pages), name, slot))
@@ -267,11 +341,19 @@ def open_in_chrome(path: Path):
 
 def main():
     load_env()
-    src = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else HOME / "Downloads/fp"
+    ap = argparse.ArgumentParser(
+        description="发票 + 付款截图 自动拼版为 A4 PDF")
+    ap.add_argument("src", nargs="?", default=str(HOME / "Downloads/fp"),
+                    help="材料目录（默认 ~/Downloads/fp）")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="忽略缓存，所有截图重新识别（新结果写回缓存）")
+    args = ap.parse_args()
+
+    src = Path(args.src).resolve()
     if not src.is_dir():
         sys.exit(f"目录不存在: {src}")
     out = HOME / "Downloads" / f"{src.name}_合并.pdf"
-    build(src, out)
+    build(src, out, use_cache=not args.no_cache)
     open_in_chrome(out)
 
 

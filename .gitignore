@@ -1,0 +1,7 @@
+# 真实密钥，禁止入库
+.env
+
+# 本地运行产物
+.crop_cache.json
+__pycache__/
+*.pyc
