@@ -1,8 +1,21 @@
 # py_tool_reimbursement
-
 发票 + 付款截图 自动拼版工具：把目录里的电子发票 PDF 和手机支付截图按文件名自动分组配对，
 调用视觉大模型裁剪截图关键区域（商户、金额、支付时间、支付方式），拼成便于打印报销的
 A4 PDF——每页上下两联，发票矢量占一联、截图占一联。
+
+```shell
+ ( ➜  reimbursement git:(master) python3 ~/Projects/reimbursement/merge_fp.py --help
+usage: merge_fp.py [-h] [--no-cache] [src]
+
+发票 + 付款截图 自动拼版为 A4 PDF
+
+positional arguments:
+  src         材料目录（默认 ~/Downloads/fp）
+
+optional arguments:
+  -h, --help  show this help message and exit
+  --no-cache  忽略缓存，所有截图重新识别（新结果写回缓存）
+```
 
 ## 功能特性
 
