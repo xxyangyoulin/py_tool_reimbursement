@@ -5,7 +5,7 @@ A4 PDF——每页上下两联，发票矢量占一联、截图占一联。
 
 ```shell
  ( ➜  reimbursement git:(master) python3 ~/Projects/reimbursement/merge_fp.py --help
-usage: merge_fp.py [-h] [--no-cache] [src]
+usage: merge_fp.py [-h] [--no-cache] [--code CODE] [src]
 
 发票 + 付款截图 自动拼版为 A4 PDF
 
@@ -15,12 +15,16 @@ positional arguments:
 optional arguments:
   -h, --help  show this help message and exit
   --no-cache  忽略缓存，所有截图重新识别（新结果写回缓存）
+  --code CODE 编号（如 202609290007），印在每张发票右上角
 ```
 
 ## 功能特性
 
 - **自动分组**：按文件名前缀（去尾部数字）分组，如 `yyl.pdf` / `yyl1.jpg` / `yyl2.jpg` → `yyl` 组；
   组内发票在前、截图按编号排序，两两配对占满一页
+- **发票金额汇总**：直接从发票 PDF 文字层提取价税合计（不依赖 AI），逐张输出并汇总合计，
+  扫描图片型发票自动跳过并提示
+- **编号标注**：`--code 202609290007` 在每张发票右上角印上白底黑字编号标签，便于报销归档
 - **AI 智能裁剪**：截图发给视觉模型，返回关键信息区域的百分比坐标；
   兼容任意 OpenAI 兼容接口，默认智谱 `glm-5.3-flash`
 - **本地缓存**：裁剪坐标按「文件名 + 修改时间 + 大小」缓存，文件未变不重复调接口，

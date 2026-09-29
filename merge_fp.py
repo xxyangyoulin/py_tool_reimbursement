@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """发票 + 付款截图 自动拼版工具
 
-用法: python3 merge_fp.py [材料目录] [--no-cache]   (目录默认 ~/Downloads/fp)
+用法: python3 merge_fp.py [材料目录] [--no-cache] [--code 编号]
+  目录默认 ~/Downloads/fp
   --no-cache  忽略已有裁剪缓存，全部重新识别（新结果写回缓存）
+  --code      编号（如 202609290007），印在每张发票右上角
 
 流程:
 1. 扫描目录中的发票 PDF 与付款截图，按文件名前缀自动分组（去尾部数字），
@@ -33,12 +35,13 @@ import urllib.error
 import urllib.request
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 
 warnings.filterwarnings(
     "ignore", message=r"Python 3\.\d+ is no longer supported.*")
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pypdf import PdfReader, PdfWriter, Transformation
 
 # ---------- 配置 ----------
@@ -254,16 +257,62 @@ def paste_in_slot(page: Image.Image, img: Image.Image, slot: int):
     page.paste(img, (x, y))
 
 
-def compose_page(chunk, boxes: dict) -> Image.Image:
+def compose_page(chunk, boxes, code=None, stamps=()):
     page = Image.new("RGB", (round(A4_W * PX), round(A4_H * PX)), "white")
     for slot, name in enumerate(chunk):
         if name.lower().endswith(".pdf"):
             continue  # 发票位置留白，稍后矢量合并
         paste_in_slot(page, cropped_image(SRC_DIR / name, boxes[name]), slot)
+    if code:
+        for _, right_pt, top_pt in stamps:
+            draw_code(page, code, right_pt, top_pt)
     return page
 
 
-def build(src: Path, out: Path, use_cache: bool = True):
+FONT_CANDIDATES = (
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+)
+
+
+def get_font(size_px: int):
+    for p in FONT_CANDIDATES:
+        if Path(p).exists():
+            return ImageFont.truetype(p, size_px)
+    return ImageFont.load_default()
+
+
+def draw_code(page: Image.Image, code: str, right_pt: float, top_pt: float):
+    """在发票右上角（pt 坐标）画白底黑字编号标签，纵向骑在发票上边缘。"""
+    d = ImageDraw.Draw(page)
+    font = get_font(round(11 * PX))
+    pad = round(5 * PX)
+    w = d.textlength(code, font=font)
+    box_h = font.size + pad * 2
+    x2 = round(right_pt * PX) - pad - round(10 * PX)
+    edge_y = round(page.height - top_pt * PX)
+    y1 = edge_y - box_h // 4
+    box = (x2 - w - pad * 2, y1, x2, y1 + box_h)
+    d.rounded_rectangle(box, radius=8, fill="white", outline=(0, 0, 0), width=3)
+    d.text((box[0] + pad, y1 + pad), code, fill=(0, 0, 0), font=font)
+
+
+AMOUNT_RE = re.compile(r"[¥￥]\s*([0-9,]+(?:\.[0-9]+)?)")
+
+
+def extract_invoice_amount(page):
+    """从发票页文字层提取价税合计（全文最大 ¥ 金额，不依赖 AI）。
+
+    图片扫描件无文字层时返回 None。
+    """
+    text = page.extract_text() or ""
+    nums = [Decimal(m.replace(",", "")) for m in AMOUNT_RE.findall(text)]
+    return max(nums) if nums else None
+
+
+def build(src: Path, out: Path, use_cache: bool = True, code: str = None):
     groups = discover(src, exclude={out.name})
     if not groups:
         sys.exit(f"目录 {src} 中没有找到 PDF 或图片")
@@ -289,14 +338,31 @@ def build(src: Path, out: Path, use_cache: bool = True):
                 print(f"  [{how}] {n}: 裁剪 {boxes[n][0]:.0f}% ~ {boxes[n][1]:.0f}%")
         save_cache(cache)
 
-    # 2) 拼版合成
-    for _, items in groups:
-        for i in range(0, len(items), 2):
-            chunk = items[i:i + 2]
-            pages.append(compose_page(chunk, boxes))
-            for slot, name in enumerate(chunk):
-                if name.lower().endswith(".pdf"):
-                    invoice_slots.append((len(pages), name, slot))
+    # 2) 拼版合成：全局顺序两两配对（组内项相邻故组内优先成对；
+    #    上一组落单的半栏由下一组的项补齐，发票不会因此另起新页）
+    items = [n for _, its in groups for n in its]
+    inv_readers = {}
+
+    def load_inv(name):
+        if name not in inv_readers:
+            inv_readers[name] = PdfReader(src / name)
+        return inv_readers[name].pages[0]
+
+    for i in range(0, len(items), 2):
+        chunk = items[i:i + 2]
+        stamps = []
+        for slot, name in enumerate(chunk):
+            if not name.lower().endswith(".pdf"):
+                continue
+            inv = load_inv(name)
+            iw, ih = float(inv.mediabox.width), float(inv.mediabox.height)
+            s = min((A4_W - 2 * MARGIN) / iw, (HALF_H - 2 * MARGIN) / ih)
+            tx = (A4_W - iw * s) / 2
+            ty = ((A4_H - HALF_H) if slot == 0 else 0) + (HALF_H - ih * s) / 2
+            invoice_slots.append((len(pages) + 1, name, slot, s, tx, ty))
+            if code:  # 编号标签锚点：发票右上角
+                stamps.append((slot, tx + iw * s, ty + ih * s))
+        pages.append(compose_page(chunk, boxes, code, stamps))
 
     print(f"共 {len(pages)} 页，开始合成 PDF ...")
     buf = io.BytesIO()
@@ -309,17 +375,22 @@ def build(src: Path, out: Path, use_cache: bool = True):
     for p in reader.pages:
         writer.add_page(p)
 
-    inv_cache = {}
-    for page_no, name, slot in invoice_slots:
-        if name not in inv_cache:
-            inv_cache[name] = PdfReader(src / name).pages[0]
-        inv = inv_cache[name]
-        iw, ih = float(inv.mediabox.width), float(inv.mediabox.height)
-        s = min((A4_W - 2 * MARGIN) / iw, (HALF_H - 2 * MARGIN) / ih)
-        tx = (A4_W - iw * s) / 2
-        ty = ((A4_H - HALF_H) if slot == 0 else 0) + (HALF_H - ih * s) / 2
+    for page_no, name, slot, s, tx, ty in invoice_slots:
         writer.pages[page_no - 1].merge_transformed_page(
-            inv, Transformation().scale(s).translate(tx, ty))
+            load_inv(name), Transformation().scale(s).translate(tx, ty))
+
+    # 发票金额汇总（文字层提取，不用 AI）
+    print("发票金额（价税合计）:")
+    total = Decimal("0")
+    for name in sorted(inv_readers):
+        amt = extract_invoice_amount(inv_readers[name].pages[0])
+        if amt is None:
+            print(f"  {name}: 未提取到金额（可能是扫描图片型发票）")
+        else:
+            total += amt
+            print(f"  {name}: ¥{amt:,.2f}")
+    if total:
+        print(f"发票合计: ¥{total:,.2f}")
 
     with open(out, "wb") as f:
         writer.write(f)
@@ -347,13 +418,15 @@ def main():
                     help="材料目录（默认 ~/Downloads/fp）")
     ap.add_argument("--no-cache", action="store_true",
                     help="忽略缓存，所有截图重新识别（新结果写回缓存）")
+    ap.add_argument("--code",
+                    help="编号（如 202609290007），印在每张发票右上角")
     args = ap.parse_args()
 
     src = Path(args.src).resolve()
     if not src.is_dir():
         sys.exit(f"目录不存在: {src}")
     out = HOME / "Downloads" / f"{src.name}_合并.pdf"
-    build(src, out, use_cache=not args.no_cache)
+    build(src, out, use_cache=not args.no_cache, code=args.code)
     open_in_chrome(out)
 
 
