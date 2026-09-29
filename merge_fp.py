@@ -4,7 +4,7 @@
 用法: python3 merge_fp.py [材料目录] [--no-cache] [--code 编号]
   目录默认 ~/Downloads/fp
   --no-cache  忽略已有裁剪缓存，全部重新识别（新结果写回缓存）
-  --code      编号（如 202609290007），印在每张发票右上角
+  --code      编号（如 202609290007），印在每个半页右上角（便于对折裁剪后归档）
 
 流程:
 1. 扫描目录中的发票 PDF 与付款截图，按文件名前缀自动分组（去尾部数字），
@@ -257,15 +257,15 @@ def paste_in_slot(page: Image.Image, img: Image.Image, slot: int):
     page.paste(img, (x, y))
 
 
-def compose_page(chunk, boxes, code=None, stamps=()):
+def compose_page(chunk, boxes, code=None):
     page = Image.new("RGB", (round(A4_W * PX), round(A4_H * PX)), "white")
     for slot, name in enumerate(chunk):
         if name.lower().endswith(".pdf"):
             continue  # 发票位置留白，稍后矢量合并
         paste_in_slot(page, cropped_image(SRC_DIR / name, boxes[name]), slot)
-    if code:
-        for _, right_pt, top_pt in stamps:
-            draw_code(page, code, right_pt, top_pt)
+    if code:  # 每个半张的右上角：上半张=页面右上，下半张=折线右上（对折裁剪后各半张都有编号）
+        for top_pt in (A4_H, HALF_H):
+            draw_code(page, code, A4_W, top_pt)
     return page
 
 
@@ -285,15 +285,14 @@ def get_font(size_px: int):
 
 
 def draw_code(page: Image.Image, code: str, right_pt: float, top_pt: float):
-    """在发票右上角（pt 坐标）画白底黑字编号标签，纵向骑在发票上边缘。"""
+    """在给定上边缘（pt 坐标）下方、页面右缘内侧画白底黑字编号标签。"""
     d = ImageDraw.Draw(page)
     font = get_font(round(11 * PX))
     pad = round(5 * PX)
     w = d.textlength(code, font=font)
     box_h = font.size + pad * 2
     x2 = round(right_pt * PX) - pad - round(10 * PX)
-    edge_y = round(page.height - top_pt * PX)
-    y1 = edge_y - box_h // 4
+    y1 = round(page.height - top_pt * PX) + pad + round(6 * PX)
     box = (x2 - w - pad * 2, y1, x2, y1 + box_h)
     d.rounded_rectangle(box, radius=8, fill="white", outline=(0, 0, 0), width=3)
     d.text((box[0] + pad, y1 + pad), code, fill=(0, 0, 0), font=font)
@@ -350,7 +349,6 @@ def build(src: Path, out: Path, use_cache: bool = True, code: str = None):
 
     for i in range(0, len(items), 2):
         chunk = items[i:i + 2]
-        stamps = []
         for slot, name in enumerate(chunk):
             if not name.lower().endswith(".pdf"):
                 continue
@@ -360,9 +358,7 @@ def build(src: Path, out: Path, use_cache: bool = True, code: str = None):
             tx = (A4_W - iw * s) / 2
             ty = ((A4_H - HALF_H) if slot == 0 else 0) + (HALF_H - ih * s) / 2
             invoice_slots.append((len(pages) + 1, name, slot, s, tx, ty))
-            if code:  # 编号标签锚点：发票右上角
-                stamps.append((slot, tx + iw * s, ty + ih * s))
-        pages.append(compose_page(chunk, boxes, code, stamps))
+        pages.append(compose_page(chunk, boxes, code))
 
     print(f"共 {len(pages)} 页，开始合成 PDF ...")
     buf = io.BytesIO()
